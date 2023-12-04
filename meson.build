@@ -47,3 +47,9 @@ executable(APP_NAME, app_srcs,
 	cpp_args : cpp_args,
 	dependencies : app_dependencies,
 	include_directories : app_inc_dirs)
+
+executable('dpdk_packet_resubmit',
+	['dpdk_packet_resubmit_main.c'],
+	cpp_args : cpp_args,
+	dependencies : app_dependencies,
+	include_directories : app_inc_dirs)
