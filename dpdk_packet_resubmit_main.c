@@ -64,10 +64,7 @@ struct resubmit_app_config
     uint16_t daemon_vf_repr_id;
     uint16_t daemon_vf_id;
 
-    rte_be32_t rewrite_src_ip;
-
-    uint16_t ipv4_egress_group_id;
-
+    struct rte_flow *uplink_to_vf;
     struct rte_flow *vf_to_rss;
 
     int num_egress_rules;
@@ -207,33 +204,59 @@ int port_init(uint16_t port_id, uint16_t nb_queues, struct rte_mempool *mbuf_poo
 	return 0;
 }
 
+struct rte_flow_action_count count_action_conf = { };
+struct rte_flow_action count_action = { RTE_FLOW_ACTION_TYPE_COUNT, .conf = &count_action_conf };
+
 int create_static_flows(struct resubmit_app_config *config)
 {
     struct rte_flow_error error = {};
 
-    struct rte_flow_attr attr = {
-        .ingress = 1,
-    };
-    struct rte_flow_item items[] = {
-        { RTE_FLOW_ITEM_TYPE_ETH },
-        { RTE_FLOW_ITEM_TYPE_END },
-    };
-    struct rte_flow_action_count count = { };
-    uint16_t rss_queues[] = { 0 };
-    struct rte_flow_action_rss rss_action = {
-        .types = RTE_ETH_RSS_IP,
-        .queue_num = 1,
-        .queue = rss_queues,
-    };
-    struct rte_flow_action actions[] = {
-        { RTE_FLOW_ACTION_TYPE_COUNT, .conf = &count },
-        { RTE_FLOW_ACTION_TYPE_RSS, .conf = &rss_action },
-        { RTE_FLOW_ACTION_TYPE_END },
-    };
-    config->vf_to_rss = rte_flow_create(config->user_vf_repr_id, &attr, items, actions, &error);
-    if (error.type) {
-        printf("%s: error %d: %s\n", __func__, error.type, error.message);
-        return -1;
+    {
+        struct rte_flow_attr attr = {
+            .transfer = 1,
+        };
+        struct rte_flow_item_ethdev repr = { .port_id = config->uplink_port_id };
+        struct rte_flow_item items[] = {
+            { RTE_FLOW_ITEM_TYPE_ETH },
+            { RTE_FLOW_ITEM_TYPE_REPRESENTED_PORT, .spec = &repr, .mask = &rte_flow_item_ethdev_mask },
+            { RTE_FLOW_ITEM_TYPE_END },
+        };
+        struct rte_flow_action_port_id to_vf = { .id = config->user_vf_repr_id };
+        struct rte_flow_action actions[] = {
+            count_action,
+            { RTE_FLOW_ACTION_TYPE_PORT_ID, .conf = &to_vf },
+            { RTE_FLOW_ACTION_TYPE_END },
+        };
+        config->uplink_to_vf = rte_flow_create(config->uplink_port_id, &attr, items, actions, &error);
+        if (error.type) {
+            printf("%s: error %d: %s\n", __func__, error.type, error.message);
+            return -1;
+        }
+    }
+    {
+        struct rte_flow_attr attr = {
+            .ingress = 1,
+        };
+        struct rte_flow_item items[] = {
+            { RTE_FLOW_ITEM_TYPE_ETH },
+            { RTE_FLOW_ITEM_TYPE_END },
+        };
+        uint16_t rss_queues[] = { 0 };
+        struct rte_flow_action_rss rss_action = {
+            .types = RTE_ETH_RSS_IP,
+            .queue_num = 1,
+            .queue = rss_queues,
+        };
+        struct rte_flow_action actions[] = {
+            count_action,
+            { RTE_FLOW_ACTION_TYPE_RSS, .conf = &rss_action },
+            { RTE_FLOW_ACTION_TYPE_END },
+        };
+        config->vf_to_rss = rte_flow_create(config->user_vf_repr_id, &attr, items, actions, &error);
+        if (error.type) {
+            printf("%s: error %d: %s\n", __func__, error.type, error.message);
+            return -1;
+        }
     }
 
     return 0;
@@ -281,7 +304,6 @@ bool create_egress_flow(struct resubmit_app_config *config, struct rte_mbuf *pac
             { RTE_FLOW_ITEM_TYPE_IPV4, .spec = &ip_spec, .mask = &ip_mask },
             { RTE_FLOW_ITEM_TYPE_END },
         };
-        struct rte_flow_action_count count = { };
         struct rte_flow_action_set_ipv4 set_ipv4 = {
             .ipv4_addr = ipv4->src_addr + 0x01010101,
         };
@@ -289,7 +311,7 @@ bool create_egress_flow(struct resubmit_app_config *config, struct rte_mbuf *pac
             .id = config->uplink_port_id,
         };
         struct rte_flow_action actions[] = {
-            { RTE_FLOW_ACTION_TYPE_COUNT, .conf = &count },
+            count_action,
             { RTE_FLOW_ACTION_TYPE_SET_IPV4_SRC, .conf = &set_ipv4 },
             { RTE_FLOW_ACTION_TYPE_PORT_ID, .conf = &to_uplink },
             { RTE_FLOW_ACTION_TYPE_END },
@@ -364,7 +386,7 @@ static int lcore_pkt_proc_func(void *config_voidp)
     return 0;
 }
 
-void show_flow_stats_until_exit(struct resubmit_app_config *config)
+void print_flow_count(uint16_t port_id, struct rte_flow *flow)
 {
     struct rte_flow_query_count flow_stats = {};
     struct rte_flow_action actions[] = {
@@ -372,34 +394,43 @@ void show_flow_stats_until_exit(struct resubmit_app_config *config)
         { .type = RTE_FLOW_ACTION_TYPE_END },
     };
     struct rte_flow_error error = {};
+
+    if (rte_flow_query(port_id, flow, actions, &flow_stats, &error) == 0 &&
+        flow_stats.hits_set)
+    {
+        printf("%ld, ", flow_stats.hits);
+    } else {
+        printf("Err, ");
+    }
+}
+
+void show_flow_stats_until_exit(struct resubmit_app_config *config)
+{
     char ip_addr[INET_ADDRSTRLEN];
 
     while (!force_quit) {
         sleep(2);
 
-        printf("Flow counts: ");
-        for (int i=0; i<config->num_egress_rules + 1; i++) {
-            struct rte_flow *flow;
-            uint16_t port_id;
-            char *name;
-            if (i==0) {
-                flow = config->vf_to_rss;
-                printf("Miss-flow: ");
-                port_id = config->user_vf_repr_id;
-            } else {
-                flow = config->vf_egress[i-1];
-                inet_ntop(AF_INET, &config->egress_src_ip[i-1], ip_addr, INET_ADDRSTRLEN);
-                printf("%s-flow: ", ip_addr);
-                port_id = config->uplink_port_id;
-            }
+        struct rte_flow *static_flows[] = {
+            config->uplink_to_vf,
+            config->vf_to_rss,
+        };
+        const char *static_flow_names[] = {
+            "pf_to_vf",
+            "vf_to_rss",
+        };
+        int n_static_flows = sizeof(static_flows) / sizeof(static_flows[0]);
 
-            if (rte_flow_query(port_id, flow, actions, &flow_stats, &error) == 0 &&
-                flow_stats.hits_set)
-            {
-                printf("%ld, ", flow_stats.hits);
-            } else {
-                printf("Err, ");
-            }
+        printf("Flow counts: ");
+        for (int i=0; i<n_static_flows; i++) {
+            uint16_t port_id = (static_flows[i]==config->vf_to_rss) ? config->user_vf_repr_id : config->uplink_port_id;
+            printf("%s: ", static_flow_names[i]);
+            print_flow_count(port_id, static_flows[i]);
+        }
+        for (int i=0; i<config->num_egress_rules; i++) {
+            inet_ntop(AF_INET, &config->egress_src_ip[i], ip_addr, INET_ADDRSTRLEN);
+            printf("%s-flow: ", ip_addr);
+            print_flow_count(config->uplink_port_id, config->vf_egress[i]);
         }
         printf("\n");
     }
@@ -467,7 +498,9 @@ main(int argc, char **argv)
             printf("%s: error flushing port %d: %d: %s\n", 
                 __func__, i, error.type, error.message);
         }
-        rte_eth_dev_close(i);
+    }
+    for (uint16_t i=0; i<config.nb_ports; i++) {
+        rte_eth_dev_stop(config.nb_ports - i - 1);
     }
 
 	return 0;

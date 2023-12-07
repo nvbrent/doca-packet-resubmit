@@ -36,7 +36,7 @@ samples_common_dir_path = '/opt/mellanox/doca/samples'
 app_inc_dirs = [include_directories(common_dir_path, samples_common_dir_path)]
 
 app_srcs = [
-	'packet_resubmit_main.c',
+	'doca_packet_resubmit_main.c',
 	# DOCA-SDK-provided utilities:
 	common_dir_path + '/dpdk_utils.c',
 	samples_common_dir_path + '/common.c',
