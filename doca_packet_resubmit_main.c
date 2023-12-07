@@ -26,15 +26,15 @@
 //           |                             | Egress | --------------> [pf0repr] -> [uplink]
 //           |                             | Pipe   | [match: pkt mod]
 //         [VF1]                           +--------+
-//          ^                           (2) |    ^
-//          |                               |    |
-// +---------+                              |    |
-// |         | <-------- [miss: RSS] -------+    |
-// |         |                                   |
-// | daemon  | (3) [new pipe entry]              |
-// | process |                                   |
-// |         | ---> [VF1] --> [pf0vf1repr] ------+
-// +---------+  (4)
+//          ^                           (2) |
+//      (4) |                               |
+// +---------+                              |
+// |         | <-------- [miss: RSS] -------+
+// |         |
+// | daemon  | (3) [new pipe entry]
+// | process |
+// |         |
+// +---------+
 //
 // 1) The user application transmits a packet on its VF0 netdev
 //    The Root Pipe uses port_meta to detect the origin of the
