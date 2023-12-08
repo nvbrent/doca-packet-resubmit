@@ -49,6 +49,7 @@
 //    performs a packet mod action before sending along to the
 //    uplink port.
 
+#include <ctype.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -60,6 +61,7 @@
 
 #include <dpdk_utils.h>
 #include <doca_dpdk.h>
+#include <doca_dev.h>
 #include <doca_log.h>
 #include <doca_argp.h>
 #include <doca_flow.h>
@@ -81,6 +83,9 @@ struct port_t
 struct resubmit_app_config
 {
 	struct application_dpdk_config dpdk_config;
+
+    char *pf_pci_str;
+    char *vf_pci_str;
 
     // Switch ports:
     struct port_t uplink;
@@ -148,7 +153,7 @@ static doca_error_t open_doca_devs(struct resubmit_app_config *config)
 {
     doca_error_t result;
 
-    result = open_doca_device_with_pci("0000:ca:00.0", NULL, &config->uplink.dev);
+    result = open_doca_device_with_pci(config->pf_pci_str, NULL, &config->uplink.dev);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to open dpdk port (%s): %s", "uplink", doca_error_get_descr(result));
         return result;
@@ -160,7 +165,7 @@ static doca_error_t open_doca_devs(struct resubmit_app_config *config)
         return result;
     }
 
-    result = open_doca_device_with_pci("0000:ca:00.3", NULL, &config->daemon_vf.dev);
+    result = open_doca_device_with_pci(config->vf_pci_str, NULL, &config->daemon_vf.dev);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to open dpdk port (%s): %s", "vf", doca_error_get_descr(result));
         return result;
@@ -622,6 +627,84 @@ void show_flow_stats_until_exit(struct resubmit_app_config *config)
 	}
 }
 
+bool is_valid_pci_addr_str(char *str)
+{
+    int len = strlen(str);
+    if (len + 1 == DOCA_DEVINFO_PCI_ADDR_SIZE) {
+        int dummy[4];
+        if (sscanf(str, "%x:%x:%x.%x", &dummy[0], &dummy[1], &dummy[2], &dummy[3]) != 4) {
+            return false;
+        }
+    } else if (len + 1 == DOCA_DEVINFO_PCI_BDF_SIZE) {
+        int dummy[3];
+        if (sscanf(str, "%x:%x.%x", &dummy[0], &dummy[1], &dummy[2]) != 3) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    // convert to lower-case hex
+    for (int i=0; i < len; i++) {
+        if (str[i] >= 'A' && str[i] <= 'F') {
+            str[i] = tolower(str[i]);
+        }
+    }
+    return true;
+}
+
+doca_error_t set_arg_pf(void *param_voidp, void *config_voidp)
+{
+    if (!is_valid_pci_addr_str(param_voidp)) {
+        DOCA_LOG_ERR("--pf: expected DBDF format: XXXX:XX:XX.X or BDF format: XX:XX.X");
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+    struct resubmit_app_config *config = config_voidp;
+    config->pf_pci_str = strdup(param_voidp);
+
+    return DOCA_SUCCESS;
+}
+
+doca_error_t set_arg_vf(void *param_voidp, void *config_voidp)
+{
+    if (!is_valid_pci_addr_str(param_voidp)) {
+        DOCA_LOG_ERR("--vf: expected DBDF format: XXXX:XX:XX.X or BDF format: XX:XX.X");
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+    struct resubmit_app_config *config = config_voidp;
+    config->vf_pci_str = strdup(param_voidp);
+
+    return DOCA_SUCCESS;
+}
+
+doca_error_t create_program_args(int argc, char **argv, struct resubmit_app_config *config)
+{
+	/* Parse cmdline/json arguments */
+	doca_argp_init("resubmit-demo", config);
+
+    struct doca_argp_param *param = NULL;
+
+    doca_argp_param_create(&param);
+    doca_argp_param_set_short_name(param, "pf");
+    doca_argp_param_set_long_name(param, "phys-func");
+    doca_argp_param_set_description(param, "PCI BDF of the Physical Function");
+    doca_argp_param_set_callback(param, set_arg_pf);
+    doca_argp_param_set_type(param, DOCA_ARGP_TYPE_STRING);
+    doca_argp_param_set_mandatory(param);
+    doca_argp_register_param(param);
+
+    doca_argp_param_create(&param);
+    doca_argp_param_set_short_name(param, "vf");
+    doca_argp_param_set_long_name(param, "virt-func");
+    doca_argp_param_set_description(param, "PCI BDF of the Secondary Virtual Function");
+    doca_argp_param_set_callback(param, set_arg_vf);
+    doca_argp_param_set_type(param, DOCA_ARGP_TYPE_STRING);
+    doca_argp_param_set_mandatory(param);
+    doca_argp_register_param(param);
+
+    return DOCA_SUCCESS;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -655,13 +738,12 @@ main(int argc, char **argv)
 	if (result != DOCA_SUCCESS)
 		exit(1);
 	
-	/* Parse cmdline/json arguments */
-	doca_argp_init("resubmit-demo", &config);
-	//doca_argp_set_dpdk_program(dpdk_init);
-    // additional command line args go here
-	doca_argp_start(argc, argv);
+    create_program_args(argc, argv, &config);
+	result = doca_argp_start(argc, argv);
+    if (result != DOCA_SUCCESS)
+        exit(1);
 
-	install_signal_handler();
+    install_signal_handler();
 
     init_eal_w_no_netdevs();
 
