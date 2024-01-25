@@ -1,6 +1,6 @@
 # Packet Resubmit Example
 
-This repo shows how to handle a "miss packet" by sending it to RSS processing, creating a new flow entry for the packet, and resubmitting the packet to the new flow rule using a "secondary VF" netdev.
+This repo shows how to handle a "miss packet" by sending it to RSS processing, creating a new flow entry for the packet, and resubmitting the packet to the new flow rule.
 
 Both DPDK and DOCA Flow examples are included.
 
