@@ -17,15 +17,15 @@
 // | user | --> [VF0] --> [pf0vf0repr] --> |        | port_meta=0
 // | app  | (1)                            | Root   |-------------> [pf0vf0repr] -> [VF0]
 // +------+                                | Pipe   | (from uplink)
-//           +----------> [pf0vf1repr] --> |        |
+//           +---------------------------> |        |
 //           |                             +--------+
 //           |                                 |
-//           |                 port_meta=[1,2] |     
+//           |                     port_meta=1 |     
 //           |                                 v
 //           |                             +--------+ (5)
 //           |                             | Egress | --------------> [pf0repr] -> [uplink]
 //           |                             | Pipe   | [match: pkt mod]
-//         [VF1]                           +--------+
+//         [pf0]                           +--------+
 //          ^                           (2) |
 //      (4) |                               |
 // +---------+                              |
@@ -90,24 +90,18 @@ struct resubmit_app_config
     // Switch ports:
     struct port_t uplink;
     struct port_t user_vf_repr;
-    struct port_t daemon_vf_repr;
-    // Aux port for packet resubmit:
-    struct port_t daemon_vf;
 
     struct doca_flow_port *switch_port;
 
-    struct doca_flow_pipe *ipv4_egress_pipe;
+    struct doca_flow_pipe *ipv4_host_to_net_pipe;
     struct doca_flow_pipe *rss_pipe;
-    struct doca_flow_pipe *ingress_pipe;
-    struct doca_flow_pipe *to_uplink_pipe;
     struct doca_flow_pipe *root_pipe;
 
     struct doca_flow_pipe_entry *rss_pipe_entry;
-    struct doca_flow_pipe_entry *ingress_pipe_entry;
-    struct doca_flow_pipe_entry *to_uplink_pipe_entry;
-    struct doca_flow_pipe_entry *root_pipe_ingress_entry;
-    struct doca_flow_pipe_entry *root_pipe_egress_entry;
-    struct doca_flow_pipe_entry *root_pipe_egress_entry2;
+    struct doca_flow_pipe_entry *root_pipe_net_to_host_entry;
+    struct doca_flow_pipe_entry *root_pipe_host_to_net_entry;
+
+    uint32_t resubmit_meta_flag;
 
     int num_egress_rules;
     struct doca_flow_pipe_entry *ipv4_egress_entries[MAX_EGRESS_RULES];
@@ -138,15 +132,64 @@ static void install_signal_handler(void)
 	signal(SIGTERM, signal_handler);
 }
 
-static void init_eal_w_no_netdevs(void)
+static int disable_dpdk_accept_args(
+	int argc, 
+	char *argv[], 
+	char *dpdk_argv[], 
+	char **pci_addr_arg, 
+	char **devarg)
 {
-    char *eal_params[] = { "exe", "-a00:00.0", "-c0x3" };
-    int num_eal_params = sizeof(eal_params) / sizeof(eal_params[0]);
-    int ret = rte_eal_init(num_eal_params, eal_params);
-	if (ret < 0) {
-		DOCA_LOG_ERR("EAL initialization failed");
-        exit(1);
-	}   
+	bool prev_arg_was_a = false; // indicates prev arg was -a followed by space
+
+	for (int i=0; i<argc; i++) {		
+		if (prev_arg_was_a) {
+			// This arg should be the PCI BDF.
+			// Save it as pci_addr_arg, then
+			// replace it with the null PCI address.
+			dpdk_argv[i] = strdup("00:00.0");
+			*pci_addr_arg = strdup(argv[i]);
+			prev_arg_was_a = false;
+			continue;
+		}
+
+		if (strncmp(argv[i], "-a", 2) != 0) {
+			// copy the non-"-a" args
+			dpdk_argv[i] = strdup(argv[i]);
+			continue;
+		}
+
+		if (strlen(argv[i]) == 2) {
+			// copy the "-a", next time around replace the arg
+			dpdk_argv[i] = strdup(argv[i]);
+			prev_arg_was_a = true;
+			continue;
+		}
+
+		// This arg is the PCI BDF.
+		// Save it as pci_addr_arg, then
+		// replace it with the null PCI address.
+		*pci_addr_arg = strdup(argv[i] + 2); // skip the -a prefix
+		dpdk_argv[i] = strdup("-a00:00.0");
+	}
+
+	if (!*pci_addr_arg) {
+		return -1;
+	}
+
+	char * comma = strchr(*pci_addr_arg, ',');
+	if (comma) {
+		*comma = '\0';
+		*devarg = comma + 1;
+	} else {
+		*devarg = NULL;
+	}
+
+    int len = strlen(*pci_addr_arg);
+    for (int i=0; i<len; i++) {
+        (*pci_addr_arg)[i] = tolower((*pci_addr_arg)[i]);
+    }
+
+	return argc;
 }
 
 static doca_error_t open_doca_devs(struct resubmit_app_config *config)
@@ -159,43 +202,39 @@ static doca_error_t open_doca_devs(struct resubmit_app_config *config)
         return result;
     }
 
-    result = doca_dpdk_port_probe(config->uplink.dev, "dv_flow_en=2,dv_xmeta_en=4,representor=vf[0-1]");
+    result = doca_dpdk_port_probe(config->uplink.dev,
+        "dv_flow_en=2,"
+		"dv_xmeta_en=4,"
+		"fdb_def_rule_en=0,"
+		"vport_match=1,"
+		"repr_matching_en=0,"
+		"representor=vf0");
+
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to probe dpdk port (%s): %s", "uplink", doca_error_get_descr(result));
         return result;
     }
 
-    result = open_doca_device_with_pci(config->vf_pci_str, NULL, &config->daemon_vf.dev);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to open dpdk port (%s): %s", "vf", doca_error_get_descr(result));
-        return result;
-    }
-
-    result = doca_dpdk_port_probe(config->daemon_vf.dev, "dv_flow_en=2");
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to probe dpdk port (%s): %s", "vf", doca_error_get_descr(result));
-        return result;
-    }
     return result;
 }
 
 bool create_flow(struct resubmit_app_config *config, struct rte_mbuf *packet)
 {
-    // TODO: keep a list of previously-matched IPs and if we see them again,
-    // issue a warning and refuse to create another flow
-
 	if (RTE_ETH_IS_IPV4_HDR((packet)->packet_type)) {
 	    struct rte_ether_hdr *l2_header = rte_pktmbuf_mtod(packet, struct rte_ether_hdr *);
     	struct rte_ipv4_hdr *ipv4 = (void *)(l2_header + 1);
 
-        char ip_addr[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &ipv4->src_addr, ip_addr, sizeof(ip_addr));
+        char src_ip_addr[INET_ADDRSTRLEN];
+        char dst_ip_addr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &ipv4->src_addr, src_ip_addr, sizeof(src_ip_addr));
+        inet_ntop(AF_INET, &ipv4->dst_addr, dst_ip_addr, sizeof(dst_ip_addr));
         
         for (int i=0; i<config->num_egress_rules; i++) {
             if (config->egress_src_ip[i] == ipv4->src_addr) {
                 ++config->unexpected_packet_count;
-                DOCA_LOG_WARN("Warning: received packet from %s for which we already have a flow", ip_addr);
-                if (config->unexpected_packet_count > 3)
+                DOCA_LOG_WARN("Warning: received packet %s->%s for which we already have a flow", 
+                    src_ip_addr, dst_ip_addr);
+                if (config->unexpected_packet_count > 50)
                     sleep(1);
                 return true;
             }
@@ -225,7 +264,7 @@ bool create_flow(struct resubmit_app_config *config, struct rte_mbuf *packet)
             },
         };
         doca_flow_pipe_add_entry(
-            1, config->ipv4_egress_pipe, &match, &actions, &count, NULL, DOCA_FLOW_NO_WAIT, NULL, 
+            1, config->ipv4_host_to_net_pipe, &match, &actions, &count, NULL, DOCA_FLOW_NO_WAIT, NULL, 
             &config->ipv4_egress_entries[config->num_egress_rules]);
         
         doca_flow_entries_process(
@@ -234,13 +273,17 @@ bool create_flow(struct resubmit_app_config *config, struct rte_mbuf *packet)
         config->egress_src_ip[config->num_egress_rules] = ipv4->src_addr;
         ++config->num_egress_rules;
 
-        DOCA_LOG_INFO("Created flow for IP src %s", ip_addr);
+        DOCA_LOG_INFO("Created flow for IP %s->%s", src_ip_addr, dst_ip_addr);
+
+        // Mark the packet so the egress pipe will modify and forward it
+        *RTE_MBUF_DYNFIELD(packet, rte_flow_dynf_metadata_offs, uint32_t*) = config->resubmit_meta_flag;
+        packet->ol_flags |= rte_flow_dynf_metadata_mask;
 
         return true;
     } else {
 	    //struct rte_ether_hdr *l2_header = rte_pktmbuf_mtod(packet, struct rte_ether_hdr *);
 		//struct rte_ipv6_hdr *ipv6 = (void *)(l2_header + 1);
-        return true;
+        return false;
     }
 }
 
@@ -269,24 +312,25 @@ static int lcore_pkt_proc_func(void *config_voidp)
 	struct rte_mbuf *mbufs_tx[MAX_BURST_SIZE];
 
     uint16_t queue_id = 0;
-    log_port_start("l-core polling on port", config->daemon_vf_repr.port_id);
+    uint16_t port_id = config->uplink.port_id;
+    log_port_start("l-core polling on port", port_id);
 
     while (!force_quit) {
-        for (uint16_t port_id = 0; port_id < config->dpdk_config.port_config.nb_ports; port_id++) {
-            uint16_t num_rx = rte_eth_rx_burst(port_id, queue_id, mbufs_rx, MAX_BURST_SIZE);
-            if (num_rx)
-                DOCA_LOG_INFO("Port %d: Received %d packets", port_id, num_rx);
-            
-            uint16_t num_tx = 0;
-            for (uint16_t i=0; i<num_rx; i++) {
-                if (create_flow(config, mbufs_rx[i])) {
-                    mbufs_tx[num_tx++] = mbufs_rx[i];
-                }
+        uint16_t num_rx = rte_eth_rx_burst(port_id, queue_id, mbufs_rx, MAX_BURST_SIZE);
+        // if (num_rx)
+        //     DOCA_LOG_INFO("Port %d: Received %d packets", port_id, num_rx);
+        
+        uint16_t num_tx = 0;
+        for (uint16_t i=0; i<num_rx; i++) {
+            if (create_flow(config, mbufs_rx[i])) {
+                mbufs_tx[num_tx++] = mbufs_rx[i];
+            } else {
+                rte_pktmbuf_free(mbufs_rx[i]);
             }
-
-            if (num_tx)
-                rte_eth_tx_burst(config->daemon_vf.port_id, queue_id, mbufs_tx, num_tx);
         }
+
+        if (num_tx)
+            rte_eth_tx_burst(port_id, queue_id, mbufs_tx, num_tx);
     }
 
     return 0;
@@ -315,7 +359,7 @@ int
 flow_init(struct resubmit_app_config *config)
 {
 	struct doca_flow_cfg flow_cfg = {
-		.mode_args = "switch,hws",
+		.mode_args = "switch,hws,isolated",
 		.queues = config->dpdk_config.port_config.nb_queues,
 		.resource.nb_counters = 1024,
 		//.cb = check_for_valid_entry,
@@ -329,8 +373,6 @@ flow_init(struct resubmit_app_config *config)
 
     port_init(&config->uplink); // cannot return null    
     port_init(&config->user_vf_repr);
-    port_init(&config->daemon_vf_repr);
-    port_init(&config->daemon_vf);
 
     config->switch_port = doca_flow_port_switch_get(config->uplink.port);
 
@@ -354,6 +396,7 @@ void create_root_pipe(struct resubmit_app_config *config)
     };
     struct doca_flow_fwd fwd = {
         .type = DOCA_FLOW_FWD_PIPE,
+        .next_pipe = config->ipv4_host_to_net_pipe,
     };
     doca_error_t result = doca_flow_pipe_create(&pipe_cfg, &fwd, NULL, &config->root_pipe);
     if (result != DOCA_SUCCESS) {
@@ -361,63 +404,19 @@ void create_root_pipe(struct resubmit_app_config *config)
         exit(1);
     }
 
-    match_port_meta.parser_meta.port_meta = 0;
-    fwd.next_pipe = config->ingress_pipe;
+    // Packets coming from port_id 0 Tx queue will bypass the 
+    // ingress/default domain and skip to the egress domain.
 
-    result = doca_flow_pipe_add_entry(0, config->root_pipe, &match_port_meta, NULL, NULL, &fwd, DOCA_FLOW_NO_WAIT, NULL, &config->root_pipe_ingress_entry);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
-        exit(1);
-    }
-
-    match_port_meta.parser_meta.port_meta = 1;
-    fwd.next_pipe = config->ipv4_egress_pipe;
-    result = doca_flow_pipe_add_entry(0, config->root_pipe, &match_port_meta, NULL, NULL, &fwd, DOCA_FLOW_NO_WAIT, NULL, &config->root_pipe_egress_entry);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
-        exit(1);
-    }
-
-    match_port_meta.parser_meta.port_meta = 2;
-    fwd.next_pipe = config->ipv4_egress_pipe;
-    result = doca_flow_pipe_add_entry(0, config->root_pipe, &match_port_meta, NULL, NULL, &fwd, DOCA_FLOW_NO_WAIT, NULL, &config->root_pipe_egress_entry2);
+    match_port_meta.parser_meta.port_meta = config->user_vf_repr.port_id;
+    result = doca_flow_pipe_add_entry(0, config->root_pipe, &match_port_meta, NULL, NULL, &fwd, DOCA_FLOW_NO_WAIT, NULL, 
+        &config->root_pipe_host_to_net_entry);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
         exit(1);
     }
 }
 
-void
-create_ingress_ipv4_pipe(struct resubmit_app_config *config)
-{
-    struct doca_flow_pipe_cfg pipe_cfg = {
-        .attr = {
-            .name = "ingress_ipv4",
-            .domain = DOCA_FLOW_PIPE_DOMAIN_EGRESS,
-        },
-        .port = config->switch_port,
-        .match = &empty_match,
-        .monitor = &count,
-    };
-
-    struct doca_flow_fwd fwd = {
-        .type = DOCA_FLOW_FWD_PORT,
-        .port_id = config->user_vf_repr.port_id,
-    };
-
-    doca_error_t result = doca_flow_pipe_create(&pipe_cfg, &fwd, NULL, &config->ingress_pipe);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create pipe %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
-        exit(1);
-    }
-    result = doca_flow_pipe_add_entry(0, config->ingress_pipe, NULL, NULL, NULL, NULL, DOCA_FLOW_NO_WAIT, NULL, &config->ingress_pipe_entry);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
-        exit(1);
-    }
-}
-
-void create_egress_ipv4_match_pipe(struct resubmit_app_config *config)
+void create_ipv4_host_to_net_match_pipe(struct resubmit_app_config *config)
 {
     struct doca_flow_match match = {
         .parser_meta = {
@@ -443,7 +442,9 @@ void create_egress_ipv4_match_pipe(struct resubmit_app_config *config)
     struct doca_flow_pipe_cfg pipe_cfg = {
         .attr = {
             .name = "IPv4_Egress",
+            .is_root = true,
             .nb_actions = 1,
+            .domain = DOCA_FLOW_PIPE_DOMAIN_EGRESS,
             .miss_counter = true,
         },
         .port = config->switch_port,
@@ -454,50 +455,21 @@ void create_egress_ipv4_match_pipe(struct resubmit_app_config *config)
     };
 
     struct doca_flow_fwd fwd = {
-        .type = DOCA_FLOW_FWD_PIPE,
-        .next_pipe = config->to_uplink_pipe,
+        .type = DOCA_FLOW_FWD_PORT,
+        .port_id = config->uplink.port_id,
     };
     struct doca_flow_fwd fwd_miss = {
         .type = DOCA_FLOW_FWD_PIPE,
         .next_pipe = config->rss_pipe,
     };
 
-    doca_error_t result = doca_flow_pipe_create(&pipe_cfg, &fwd, &fwd_miss, &config->ipv4_egress_pipe);
+    doca_error_t result = doca_flow_pipe_create(&pipe_cfg, &fwd, &fwd_miss, &config->ipv4_host_to_net_pipe);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create pipe %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
         exit(1);
     }
 
     // No default entries
-}
-
-void create_to_uplink_pipe(struct resubmit_app_config *config)
-{
-    struct doca_flow_pipe_cfg pipe_cfg = {
-        .attr = {
-            .name = "to_uplink",
-            .domain = DOCA_FLOW_PIPE_DOMAIN_EGRESS,
-        },
-        .port = config->switch_port,
-        .match = &empty_match,
-        .monitor = &count,
-    };
-
-    struct doca_flow_fwd fwd = {
-        .type = DOCA_FLOW_FWD_PORT,
-        .port_id = config->uplink.port_id,
-    };
-
-    doca_error_t result = doca_flow_pipe_create(&pipe_cfg, &fwd, NULL, &config->to_uplink_pipe);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create pipe %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
-        exit(1);
-    }
-    result = doca_flow_pipe_add_entry(0, config->to_uplink_pipe, NULL, NULL, NULL, NULL, DOCA_FLOW_NO_WAIT, NULL, &config->to_uplink_pipe_entry);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
-        exit(1);
-    }
 }
 
 void create_to_rss_pipe(struct resubmit_app_config *config)
@@ -538,27 +510,19 @@ create_pipes(struct resubmit_app_config *config)
     doca_error_t result;
 
     // root_pipe: match(port_meta)
-    //   +- port_meta==[0]   --> ingress_ipv4 --> pf0vf0repr // traffic from uplink
-    //   +- port_meta==[1,2] --> egress_ipv4 // traffic from VF0, VF1
-    //                               +- [match src_ip] --> [pkt mod] --> to_uplink_pipe --> p0 uplink
+    //   +- port_meta==[0]   --> ipv4_net_to_host --> pf0vf0repr // traffic from uplink
+    //   +- port_meta==[1]   --> ipv4_host_to_net // traffic from VF0, VF1
+    //                               +- [match src_ip] --> [pkt mod] --> p0 uplink
     //                               +-    [ miss ]    --> rss_pipe --> pf0/RxQ[0] --> vf1/TxQ[0]
 
     // Create from back to front...
     create_to_rss_pipe(config);
-    create_to_uplink_pipe(config);
-    create_egress_ipv4_match_pipe(config);
-    create_ingress_ipv4_pipe(config);
+    create_ipv4_host_to_net_match_pipe(config);
     create_root_pipe(config);
 
     result = doca_flow_entries_process(config->switch_port, 0, 0, 0);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to process entries for port %d: %s", config->uplink.port_id, doca_error_get_descr(result));
-        exit(1);
-    }
-
-    result = doca_flow_entries_process(config->daemon_vf.port, 0, 0, 0);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to process entries for port %d: %s", config->daemon_vf.port_id, doca_error_get_descr(result));
         exit(1);
     }
 }
@@ -575,25 +539,19 @@ void show_flow_stats_until_exit(struct resubmit_app_config *config)
 {
 
     struct doca_flow_pipe_entry *entries_to_query[] = {
-        config->root_pipe_ingress_entry,
-        config->root_pipe_egress_entry,
-        config->root_pipe_egress_entry2,
-        config->ingress_pipe_entry,
-        config->to_uplink_pipe_entry,
+        config->root_pipe_net_to_host_entry,
+        config->root_pipe_host_to_net_entry,
         config->rss_pipe_entry,
     };
     char *entry_names[] = {
-        "root_ingress_entry",
-        "root_egress_vf0",
-        "root_egress_vf1",
-        "ingress_entry",
-        "to_uplink",
+        "root_net_to_host_entry",
+        "root_host_to_net_vf0",
         "rss_pipe",
     };
     int n_entries_to_query = sizeof(entries_to_query) / sizeof(entries_to_query[0]);
 
     struct doca_flow_pipe *pipe_miss_to_query[] = {
-        config->ipv4_egress_pipe,
+        config->ipv4_host_to_net_pipe,
         //config->root_pipe,
     };
     int n_pipes_to_query = sizeof(pipe_miss_to_query) / sizeof(pipe_miss_to_query[0]);
@@ -677,30 +635,11 @@ doca_error_t set_arg_vf(void *param_voidp, void *config_voidp)
     return DOCA_SUCCESS;
 }
 
-doca_error_t create_program_args(int argc, char **argv, struct resubmit_app_config *config)
+doca_error_t create_program_args(struct resubmit_app_config *config)
 {
 	/* Parse cmdline/json arguments */
 	doca_argp_init("resubmit-demo", config);
-
-    struct doca_argp_param *param = NULL;
-
-    doca_argp_param_create(&param);
-    doca_argp_param_set_short_name(param, "pf");
-    doca_argp_param_set_long_name(param, "phys-func");
-    doca_argp_param_set_description(param, "PCI BDF of the Physical Function");
-    doca_argp_param_set_callback(param, set_arg_pf);
-    doca_argp_param_set_type(param, DOCA_ARGP_TYPE_STRING);
-    doca_argp_param_set_mandatory(param);
-    doca_argp_register_param(param);
-
-    doca_argp_param_create(&param);
-    doca_argp_param_set_short_name(param, "vf");
-    doca_argp_param_set_long_name(param, "virt-func");
-    doca_argp_param_set_description(param, "PCI BDF of the Secondary Virtual Function");
-    doca_argp_param_set_callback(param, set_arg_vf);
-    doca_argp_param_set_type(param, DOCA_ARGP_TYPE_STRING);
-    doca_argp_param_set_mandatory(param);
-    doca_argp_register_param(param);
+	doca_argp_set_dpdk_program(dpdk_init);
 
     return DOCA_SUCCESS;
 }
@@ -708,20 +647,22 @@ doca_error_t create_program_args(int argc, char **argv, struct resubmit_app_conf
 int
 main(int argc, char **argv)
 {
+	char **dpdk_argv = malloc(argc * sizeof(void*)); // same as argv but without -a arguments	
+	char *dummy_devargs = NULL;
+
 	struct resubmit_app_config config = {
 		.dpdk_config = {
 			.port_config = {
 				.nb_ports = 0, // updated after dpdk_init()
 				.nb_queues = 1,
 				.nb_hairpin_q = 1,
-                //.isolated_mode = true,
+                .isolated_mode = true,
                 .enable_mbuf_metadata = true,
 			},
 		},
 		.uplink.port_id = 0,
 		.user_vf_repr.port_id = 1,
-		.daemon_vf_repr.port_id = 2,
-        .daemon_vf.port_id = 3,
+        .resubmit_meta_flag = 0x55,
 	};
 
 	/* Register a logger backend */
@@ -738,18 +679,21 @@ main(int argc, char **argv)
 	if (result != DOCA_SUCCESS)
 		exit(1);
 	
-    create_program_args(argc, argv, &config);
-	result = doca_argp_start(argc, argv);
+	disable_dpdk_accept_args(argc, argv, dpdk_argv, &config.pf_pci_str, &dummy_devargs);
+
+    create_program_args(&config);
+	result = doca_argp_start(argc, dpdk_argv);
     if (result != DOCA_SUCCESS)
         exit(1);
 
     install_signal_handler();
 
-    init_eal_w_no_netdevs();
+	rte_flow_dynf_metadata_register();
 
     open_doca_devs(&config);
 
-	config.dpdk_config.port_config.nb_ports = rte_eth_dev_count_avail(); // attach to the PF and all the available VFs
+	config.dpdk_config.port_config.nb_ports = rte_eth_dev_count_avail();
+
     DOCA_LOG_INFO("Detected %d ports", config.dpdk_config.port_config.nb_ports);
 
 	dpdk_queues_and_ports_init(&config.dpdk_config);
@@ -773,8 +717,6 @@ main(int argc, char **argv)
 		rte_eal_wait_lcore(lcore_id);
 	}
 
-    doca_flow_port_stop(config.daemon_vf.port);
-    doca_flow_port_stop(config.daemon_vf_repr.port);
     doca_flow_port_stop(config.user_vf_repr.port);
     doca_flow_port_stop(config.uplink.port);
 	

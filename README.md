@@ -11,15 +11,15 @@ The following flow chart illustrates the packet processing logic.
 | user | --> [VF0] --> [pf0vf0repr] --> |        | port_meta=0
 | app  | (1)                            | Root   |-------------> [pf0vf0repr] -> [VF0]
 +------+                                | Pipe   | (from uplink)
-          +----------> [pf0vf1repr] --> |        |
+          +---------------------------> |        |
           |                             +--------+
           |                                 |
-          |                 port_meta=[1,2] |     
+          |                     port_meta=1 |     
           |                                 v
           |                             +--------+ (5)
           |                             | Egress | --------------> [pf0repr] -> [uplink]
           |                             | Pipe   | [match: pkt mod]
-        [VF1]                           +--------+
+        [pf0]                           +--------+
          ^                           (2) |
      (4) |                               |
 +---------+                              |
@@ -47,7 +47,11 @@ The following flow chart illustrates the packet processing logic.
 Usage for doca-packet-resubmit:
 
 ```
-Usage: resubmit-demo [DOCA Flags] [Program Flags]
+Usage: resubmit-demo [DPDK Flags] -- [DOCA Flags]
+
+DPDK RTE EAL Flags: per https://doc.dpdk.org/guides/linux_gsg/linux_eal_parameters.html
+  -a                                Accept-list of PCI addresses
+  (etc.)
 
 DOCA Flags:
   -h, --help                        Print a help synopsis
@@ -55,14 +59,10 @@ DOCA Flags:
   -l, --log-level                   Set the (numeric) log level for the program <10=DISABLE, 20=CRITICAL, 30=ERROR, 40=WARNING, 50=INFO, 60=DEBUG, 70=TRACE>
   --sdk-log-level                   Set the SDK (numeric) log level for the program <10=DISABLE, 20=CRITICAL, 30=ERROR, 40=WARNING, 50=INFO, 60=DEBUG, 70=TRACE>
   -j, --json <path>                 Parse all command flags from an input json file
-
-Program Flags:
-  -pf, --phys-func                  PCI BDF of the Physical Function
-  -vf, --virt-func                  PCI BDF of the Secondary Virtual Function
   ```
 Example:
 ```
-> doca-packet-resubmit -pf CA:00.0 -vf CA:00.2
+> build/doca-packet-resubmit -aCA:00.0 -c0xa
 
 EAL: Detected CPU lcores: 64
 EAL: Detected NUMA nodes: 2
@@ -72,30 +72,48 @@ EAL: Selected IOVA mode 'PA'
 EAL: VFIO support initialized
 TELEMETRY: No legacy callbacks, legacy socket not created
 EAL: Probe PCI driver: mlx5_pci (15b3:1021) device: 0000:ca:00.0 (socket 1)
-EAL: Probe PCI driver: mlx5_pci (15b3:101e) device: 0000:ca:00.2 (socket 1)
-[23:04:29:051337][2327813][DOCA][INF][doca_packet_resubmit_main.c:753][main] Detected 4 ports
-[23:04:29:152473][2327813][DOCA][WRN][engine_model.c:72][adapt_queue_depth] adapting queue depth to 128.
-mlx5_net: [mlx5dr_rule_skip]: Fail to map port ID 65535, ignoring
-[23:04:30:392966][2327813][DOCA][INF][doca_packet_resubmit_main.c:252][log_port_start] 
+mlx5_net: port 0 ingress traffic is restricted to defined flow rules (isolated mode) since representor matching is disabled
+mlx5_net: port 1 ingress traffic is restricted to defined flow rules (isolated mode) since representor matching is disabled
+[23:05:59:502879][2078570][DOCA][INF][doca_packet_resubmit_main.c:704][main] Detected 2 ports
+mlx5_net: port 0 cannot enable promiscuous mode in flow isolation mode
+[23:05:59:525157][2078570][DOCA][INF][dpdk_utils.c:425][port_init] Ingress traffic on port 0 is in isolated mode
+mlx5_net: port 0 cannot enable promiscuous mode in flow isolation mode
+mlx5_net: port 1 cannot enable promiscuous mode in flow isolation mode
+[23:05:59:545083][2078570][DOCA][INF][dpdk_utils.c:425][port_init] Ingress traffic on port 1 is in isolated mode
+mlx5_net: port 1 cannot enable promiscuous mode in flow isolation mode
+[23:05:59:560403][2078570][DOCA][WRN][engine_model.c:72][adapt_queue_depth] adapting queue depth to 128.
+mlx5_net: port 0 cannot enable promiscuous mode in flow isolation mode
+[23:06:00:529138][2078570][DOCA][INF][doca_packet_resubmit_main.c:295][log_port_start]
 Started doca_flow_port:: port 0: 94:6d:ae:47:a2:d2
 
-[23:04:31:126392][2327813][DOCA][INF][doca_packet_resubmit_main.c:252][log_port_start] 
-Started doca_flow_port:: port 1: 8e:74:cd:8f:de:d1
+mlx5_net: port 1 cannot enable promiscuous mode in flow isolation mode
+[23:06:01:037400][2078570][DOCA][INF][doca_packet_resubmit_main.c:295][log_port_start]
+Started doca_flow_port:: port 1: 8e:69:dd:c2:fd:30
 
-[23:04:31:692724][2327813][DOCA][INF][doca_packet_resubmit_main.c:252][log_port_start] 
-Started doca_flow_port:: port 2: ee:b0:01:bd:ef:bf
+[23:06:01:088001][2078570][DOCA][INF][doca_packet_resubmit_main.c:712][main] Starting l-cores...
+[23:06:01:088157][2078573][DOCA][INF][doca_packet_resubmit_main.c:295][log_port_start]
+l-core polling on port: port 0: 94:6d:ae:47:a2:d2
 
-[23:04:32:801993][2327813][DOCA][WRN][dpdk_port_legacy.c:1238][port_is_switch_manager] failed getting proxy port for port id 3 - rc=-22
-[23:04:32:854947][2327813][DOCA][INF][doca_packet_resubmit_main.c:252][log_port_start] 
-Started doca_flow_port:: port 3: 76:85:12:3f:b0:a7
-
-[23:04:32:948312][2327813][DOCA][INF][doca_packet_resubmit_main.c:761][main] Starting l-cores...
-[23:04:32:948473][2327813][DOCA][INF][doca_packet_resubmit_main.c:765][main] Waiting for signal...
-[23:04:32:948475][2327817][DOCA][INF][doca_packet_resubmit_main.c:252][log_port_start] 
-l-core polling on port: port 2: ee:b0:01:bd:ef:bf
-
-Static Entry Counters: root_ingress_entry: 0, root_egress_vf0: 0, root_egress_vf1: 0, ingress_entry: 0, to_uplink: 0, rss_pipe: 0, ; egress entry counters: ; Pipe Miss counters: 0, 
-Static Entry Counters: root_ingress_entry: 0, root_egress_vf0: 0, root_egress_vf1: 0, ingress_entry: 0, to_uplink: 0, rss_pipe: 0, ; egress entry counters: ; Pipe Miss counters: 0, 
-Static Entry Counters: root_ingress_entry: 0, root_egress_vf0: 76, root_egress_vf1: 0, ingress_entry: 0, to_uplink: 52, rss_pipe: 0, ; egress entry counters: 10.20.30.1-flow: 2, 10.20.30.2-flow: 2, 10.20.30.5-flow: 2, 10.20.30.6-flow: 2, 10.20.30.8-flow: 2, 10.20.30.11-flow: 2, 10.20.30.12-flow: 2, 10.20.30.15-flow: 2, 10.20.30.16-flow: 2, 10.20.30.19-flow: 2, 10.20.30.20-flow: 2, 10.20.30.23-flow: 2, 10.20.30.25-flow: 2, 10.20.30.26-flow: 2, 10.20.30.29-flow: 2, 10.20.30.30-flow: 2, 10.20.30.32-flow: 2, 10.20.30.35-flow: 2, 10.20.30.36-flow: 2, 10.20.30.39-flow: 2, 10.20.30.41-flow: 2, 10.20.30.42-flow: 2, 10.20.30.45-flow: 2, 10.20.30.46-flow: 2, 10.20.30.49-flow: 2, 10.20.30.50-flow: 2, ; Pipe Miss counters: 24, 
+[23:06:01:088163][2078570][DOCA][INF][doca_packet_resubmit_main.c:716][main] Waiting for signal...
+Static Entry Counters: root_host_to_net_vf0: 0, rss_pipe: 1, ; egress entry counters: ; Pipe Miss counters: 1,
+Static Entry Counters: root_host_to_net_vf0: 0, rss_pipe: 1, ; egress entry counters: ; Pipe Miss counters: 1,
+[23:06:09:154524][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.101->20.1.1.100
+[23:06:09:155511][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.102->20.1.1.100
+[23:06:09:156546][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.103->20.1.1.100
+[23:06:09:157605][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.104->20.1.1.100
+[23:06:09:158627][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.105->20.1.1.100
+[23:06:09:159636][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.106->20.1.1.100
+[23:06:09:160648][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.107->20.1.1.100
+[23:06:09:161691][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.108->20.1.1.100
+[23:06:09:162530][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.109->20.1.1.100
+[23:06:09:162952][2078573][DOCA][INF][doca_packet_resubmit_main.c:276][create_flow] Created flow for IP 192.168.99.110->20.1.1.100
+Static Entry Counters: root_host_to_net_vf0: 10, rss_pipe: 11, ; egress entry counters: 192.168.99.101-flow: 1, 192.168.99.102-flow: 1, 192.168.99.103-flow: 1, 192.168.99.104-flow: 1, 192.168.99.105-flow: 1, 192.168.99.106-flow: 1, 192.168.99.107-flow: 1, 192.168.99.108-flow: 1, 192.168.99.109-flow: 1, 192.168.99.110-flow: 1, ; Pipe Miss counters: 11,
+Static Entry Counters: root_host_to_net_vf0: 10, rss_pipe: 11, ; egress entry counters: 192.168.99.101-flow: 1, 192.168.99.102-flow: 1, 192.168.99.103-flow: 1, 192.168.99.104-flow: 1, 192.168.99.105-flow: 1, 192.168.99.106-flow: 1, 192.168.99.107-flow: 1, 192.168.99.108-flow: 1, 192.168.99.109-flow: 1, 192.168.99.110-flow: 1, ; Pipe Miss counters: 11,
+Static Entry Counters: root_host_to_net_vf0: 20, rss_pipe: 11, ; egress entry counters: 192.168.99.101-flow: 2, 192.168.99.102-flow: 2, 192.168.99.103-flow: 2, 192.168.99.104-flow: 2, 192.168.99.105-flow: 2, 192.168.99.106-flow: 2, 192.168.99.107-flow: 2, 192.168.99.108-flow: 2, 192.168.99.109-flow: 2, 192.168.99.110-flow: 2, ; Pipe Miss counters: 11,
+Static Entry Counters: root_host_to_net_vf0: 20, rss_pipe: 11, ; egress entry counters: 192.168.99.101-flow: 2, 192.168.99.102-flow: 2, 192.168.99.103-flow: 2, 192.168.99.104-flow: 2, 192.168.99.105-flow: 2, 192.168.99.106-flow: 2, 192.168.99.107-flow: 2, 192.168.99.108-flow: 2, 192.168.99.109-flow: 2, 192.168.99.110-flow: 2, ; Pipe Miss counters: 11,
+Static Entry Counters: root_host_to_net_vf0: 20, rss_pipe: 11, ; egress entry counters: 192.168.99.101-flow: 2, 192.168.99.102-flow: 2, 192.168.99.103-flow: 2, 192.168.99.104-flow: 2, 192.168.99.105-flow: 2, 192.168.99.106-flow: 2, 192.168.99.107-flow: 2, 192.168.99.108-flow: 2, 192.168.99.109-flow: 2, 192.168.99.110-flow: 2, ; Pipe Miss counters: 11,
+Static Entry Counters: root_host_to_net_vf0: 40, rss_pipe: 11, ; egress entry counters: 192.168.99.101-flow: 4, 192.168.99.102-flow: 4, 192.168.99.103-flow: 4, 192.168.99.104-flow: 4, 192.168.99.105-flow: 4, 192.168.99.106-flow: 4, 192.168.99.107-flow: 4, 192.168.99.108-flow: 4, 192.168.99.109-flow: 4, 192.168.99.110-flow: 4, ; Pipe Miss counters: 11,
+Static Entry Counters: root_host_to_net_vf0: 40, rss_pipe: 11, ; egress entry counters: 192.168.99.101-flow: 4, 192.168.99.102-flow: 4, 192.168.99.103-flow: 4, 192.168.99.104-flow: 4, 192.168.99.105-flow: 4, 192.168.99.106-flow: 4, 192.168.99.107-flow: 4, 192.168.99.108-flow: 4, 192.168.99.109-flow: 4, 192.168.99.110-flow: 4, ; Pipe Miss counters: 11,
 Signal 2 received, preparing to exit...
+[23:06:29:903441][2078570][DOCA][INF][doca_packet_resubmit_main.c:720][main] Shutting down...
 ```
