@@ -13,17 +13,19 @@
 
 // Application architecture:
 //
-// +------+                                +--------+
-// | user | --> [VF0] --> [pf0vf0repr] --> |        | port_meta=0
-// | app  | (1)                            | Root   |-------------> [pf0vf0repr] -> [VF0]
-// +------+                                | Pipe   | (from uplink)
+//                                         +--------+
+//              [uplink] ----------------> |        |
+// +------+                                |        |
+// | user | --> [VF0] --> [pf0vf0repr] --> | Root   | port_meta=0   +----------+
+// | app  | (1)                            | Pipe   |-------------> | N2H Pipe | ---> [pf0vf0repr] -> [VF0]
+// +------+                                |        | (from uplink) +----------+
 //           +---------------------------> |        |
 //           |                             +--------+
 //           |                                 |
 //           |                     port_meta=1 |     
 //           |                                 v
 //           |                             +--------+ (5)
-//           |                             | Egress | --------------> [pf0repr] -> [uplink]
+//           |                             | H2N    | --------------> [pf0repr] -> [uplink]
 //           |                             | Pipe   | [match: pkt mod]
 //         [pf0]                           +--------+
 //          ^                           (2) |
@@ -44,7 +46,7 @@
 // 3) The RSS processing loop creates a new flow to match the given
 //    packet.
 // 4) The RSS processing loop then transmits the same packet using
-//    its own VF1.
+//    the PF.
 // 5) The new rule in the Egress Pipe matches the resubmitted packet and
 //    performs a packet mod action before sending along to the
 //    uplink port.
@@ -94,10 +96,12 @@ struct resubmit_app_config
     struct doca_flow_port *switch_port;
 
     struct doca_flow_pipe *ipv4_host_to_net_pipe;
+    struct doca_flow_pipe *net_to_host_pipe;
     struct doca_flow_pipe *rss_pipe;
     struct doca_flow_pipe *root_pipe;
 
     struct doca_flow_pipe_entry *rss_pipe_entry;
+    struct doca_flow_pipe_entry *net_to_host_entry;
     struct doca_flow_pipe_entry *root_pipe_net_to_host_entry;
     struct doca_flow_pipe_entry *root_pipe_host_to_net_entry;
 
@@ -273,10 +277,18 @@ bool create_flow(struct resubmit_app_config *config, struct rte_mbuf *packet)
         config->egress_src_ip[config->num_egress_rules] = ipv4->src_addr;
         ++config->num_egress_rules;
 
-        DOCA_LOG_INFO("Created flow for IP %s->%s", src_ip_addr, dst_ip_addr);
+        uint32_t *pkt_meta = RTE_MBUF_DYNFIELD(packet, rte_flow_dynf_metadata_offs, uint32_t*);
+
+        if (packet->ol_flags & rte_flow_dynf_metadata_mask) {
+            DOCA_LOG_INFO("Created flow for IP %s->%s, pkt_meta was 0x%x", 
+                src_ip_addr, dst_ip_addr, *pkt_meta);
+        } else {
+            DOCA_LOG_INFO("Created flow for IP %s->%s", 
+                src_ip_addr, dst_ip_addr);
+        }
 
         // Mark the packet so the egress pipe will modify and forward it
-        *RTE_MBUF_DYNFIELD(packet, rte_flow_dynf_metadata_offs, uint32_t*) = config->resubmit_meta_flag;
+        *pkt_meta = config->resubmit_meta_flag;
         packet->ol_flags |= rte_flow_dynf_metadata_mask;
 
         return true;
@@ -396,7 +408,7 @@ void create_root_pipe(struct resubmit_app_config *config)
     };
     struct doca_flow_fwd fwd = {
         .type = DOCA_FLOW_FWD_PIPE,
-        .next_pipe = config->ipv4_host_to_net_pipe,
+        .next_pipe = NULL, // specified per entry
     };
     doca_error_t result = doca_flow_pipe_create(&pipe_cfg, &fwd, NULL, &config->root_pipe);
     if (result != DOCA_SUCCESS) {
@@ -407,9 +419,48 @@ void create_root_pipe(struct resubmit_app_config *config)
     // Packets coming from port_id 0 Tx queue will bypass the 
     // ingress/default domain and skip to the egress domain.
 
-    match_port_meta.parser_meta.port_meta = config->user_vf_repr.port_id;
+    match_port_meta.parser_meta.port_meta = config->uplink.port_id;
+    fwd.next_pipe = config->net_to_host_pipe;
     result = doca_flow_pipe_add_entry(0, config->root_pipe, &match_port_meta, NULL, NULL, &fwd, DOCA_FLOW_NO_WAIT, NULL, 
         &config->root_pipe_host_to_net_entry);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
+        exit(1);
+    }
+
+    match_port_meta.parser_meta.port_meta = config->user_vf_repr.port_id;
+    fwd.next_pipe = config->ipv4_host_to_net_pipe;
+    result = doca_flow_pipe_add_entry(0, config->root_pipe, &match_port_meta, NULL, NULL, &fwd, DOCA_FLOW_NO_WAIT, NULL, 
+        &config->root_pipe_host_to_net_entry);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
+        exit(1);
+    }
+}
+
+void create_net_to_host_pipe(struct resubmit_app_config *config)
+{
+    struct doca_flow_pipe_cfg pipe_cfg = {
+        .attr = {
+            .name = "NET_TO_HOST",
+            .domain = DOCA_FLOW_PIPE_DOMAIN_EGRESS,
+        },
+        .port = config->switch_port,
+        .match = &empty_match,
+        .monitor = &count,
+    };
+
+    struct doca_flow_fwd fwd = {
+        .type = DOCA_FLOW_FWD_PORT,
+        .port_id = config->user_vf_repr.port_id,
+    };
+
+    doca_error_t result = doca_flow_pipe_create(&pipe_cfg, &fwd, NULL, &config->net_to_host_pipe);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to create pipe %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
+        exit(1);
+    }
+    result = doca_flow_pipe_add_entry(0, config->net_to_host_pipe, NULL, NULL, NULL, NULL, DOCA_FLOW_NO_WAIT, NULL, &config->net_to_host_entry);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create dummy pipe entry %s: %s", pipe_cfg.attr.name, doca_error_get_descr(result));
         exit(1);
@@ -518,6 +569,7 @@ create_pipes(struct resubmit_app_config *config)
     // Create from back to front...
     create_to_rss_pipe(config);
     create_ipv4_host_to_net_match_pipe(config);
+    create_net_to_host_pipe(config);
     create_root_pipe(config);
 
     result = doca_flow_entries_process(config->switch_port, 0, 0, 0);

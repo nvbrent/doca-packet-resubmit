@@ -7,17 +7,21 @@ Both DPDK and DOCA Flow examples are included.
 The following flow chart illustrates the packet processing logic.
 
 ```
-+------+                                +--------+
-| user | --> [VF0] --> [pf0vf0repr] --> |        | port_meta=0
-| app  | (1)                            | Root   |-------------> [pf0vf0repr] -> [VF0]
-+------+                                | Pipe   | (from uplink)
+Application architecture:
+
+                                        +--------+
+             [uplink] ----------------> |        |
++------+                                |        |
+| user | --> [VF0] --> [pf0vf0repr] --> | Root   | port_meta=0   +----------+
+| app  | (1)                            | Pipe   |-------------> | N2H Pipe | ---> [pf0vf0repr] -> [VF0]
++------+                                |        | (from uplink) +----------+
           +---------------------------> |        |
           |                             +--------+
           |                                 |
           |                     port_meta=1 |     
           |                                 v
           |                             +--------+ (5)
-          |                             | Egress | --------------> [pf0repr] -> [uplink]
+          |                             | H2N    | --------------> [pf0repr] -> [uplink]
           |                             | Pipe   | [match: pkt mod]
         [pf0]                           +--------+
          ^                           (2) |
@@ -38,7 +42,7 @@ The following flow chart illustrates the packet processing logic.
 3) The RSS processing loop creates a new flow to match the given
    packet.
 4) The RSS processing loop then transmits the same packet using
-   its own VF1.
+   the PF.
 5) The new rule in the Egress Pipe matches the resubmitted packet and
    performs a packet mod action before sending along to the
    uplink port.
